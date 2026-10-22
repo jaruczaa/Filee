@@ -1,0 +1,74 @@
+name: Windows package
+on:
+  push:
+    branches: ['build/windows-package']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+      - name: Fetch fonts
+        run: ./build/fetch-fonts.ps1
+      - name: Restore Zig cache
+        uses: actions/cache@v5
+        with:
+          path: build/.cache/zig-x86_64-windows-0.16.0
+          key: zig-0.16.0-x86_64-windows
+      - name: Build Explorer extension
+        run: ./build/build-explorer-menu.ps1
+      - name: Fetch test engines
+        run: ./build/fetch-engines.ps1 -Only rhwp,pandoc,7zip
+      - name: Build solution
+        run: dotnet build Filee.slnx -c Release
+      - name: Test remaining projects
+        run: dotnet test Filee.slnx --no-build -c Release --filter "FullyQualifiedName!~Filee.App.Tests" --logger trx --results-directory TestResults
+      - name: Build installer and portable
+        run: ./build/build-installer.ps1 -Portable
+      - name: Verify actual installer install, update and uninstall
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem Releases/*-win-Setup.exe).FullName
+          $sandbox = Join-Path $env:RUNNER_TEMP 'filee-installer-verification'
+          $app = Join-Path $sandbox 'Program Files/Filee'
+          function Run-Setup([string]$exe) {
+            $args = @('/VERYSILENT', '/SUPPRESSMSGBOXES', "/SANDBOX=`"$sandbox`"")
+            $p = Start-Process -FilePath $exe -ArgumentList $args -WindowStyle Hidden -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Setup failed with code $($p.ExitCode)" }
+          }
+          Run-Setup $setup
+          foreach ($name in @('Filee.exe', 'filee-cli.exe', 'uninstall.exe', 'uninstall.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $app $name))) { throw "Missing installed file: $name" }
+          }
+          & (Join-Path $app 'filee-cli.exe') help
+          if ($LASTEXITCODE -ne 0) { throw 'Installed CLI failed' }
+          Run-Setup $setup
+          Run-Setup (Join-Path $app 'uninstall.exe')
+          if (Test-Path -LiteralPath $app) { throw 'Uninstall left app files' }
+          'PASS: real installer install, CLI launch, update, uninstall; non-UI test suite passed. Full UI suite tracked separately.' | Set-Content Releases/verification.txt
+          "Source commit: $env:GITHUB_SHA" | Add-Content Releases/verification.txt
+          'Unsigned custom build from jaruczaa/Filee; no upstream signing certificate used.' | Add-Content Releases/verification.txt
+      - name: Upload verified Windows packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: Filee-Windows-Package
+          path: Releases/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Filee-Test-Results
+          path: TestResults/
+          if-no-files-found: ignore
+          retention-days: 14
